@@ -25,6 +25,8 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from redaction import RedactionEngine
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -38,6 +40,9 @@ mcp = FastMCP(
 MAX_LOOKBACK_MINUTES = 60
 MAX_RESULTS = 20
 ERROR_PATTERNS = ["Error", "Exception", "Critical", "FATAL", "error", "exception"]
+
+# Initialize redaction engine for PII/credential sanitization
+redaction_engine = RedactionEngine()
 
 
 def get_cloudwatch_client():
@@ -94,6 +99,8 @@ def check_recent_errors(log_group_name: str, minutes: int = 15) -> dict[str, Any
         - Only returns logs matching: Error, Exception, Critical, FATAL
         - Results sorted by timestamp (newest first)
         - Each message truncated to 500 characters for readability
+        - SECURITY: All messages are sanitized through RedactionEngine
+          to remove PII, credentials, and other sensitive data
     """
     # Enforce safety limit
     if minutes < 1:
@@ -153,21 +160,29 @@ def check_recent_errors(log_group_name: str, minutes: int = 15) -> dict[str, Any
                 "query_id": query_id
             }
 
-        # Parse results
+        # Parse results and apply redaction
         errors = []
+        any_redacted = False
+        
         for result in results:
             entry = {}
             for field in result:
                 if field["field"] == "@timestamp":
                     entry["timestamp"] = field["value"]
                 elif field["field"] == "@message":
-                    # Truncate long messages
+                    # Truncate long messages first
                     message = field["value"]
-                    entry["message"] = message[:500] + "..." if len(message) > 500 else message
+                    message = message[:500] + "..." if len(message) > 500 else message
+                    
+                    # Apply redaction to sanitize PII and credentials
+                    safe_message, was_redacted = redaction_engine.redact(message)
+                    entry["message"] = safe_message
+                    if was_redacted:
+                        any_redacted = True
             if entry:
                 errors.append(entry)
 
-        return {
+        response = {
             "status": "success",
             "log_group": log_group_name,
             "time_range": f"Last {minutes} minutes (from {start_time.isoformat()} to {end_time.isoformat()} UTC)",
@@ -175,6 +190,12 @@ def check_recent_errors(log_group_name: str, minutes: int = 15) -> dict[str, Any
             "errors": errors,
             "query_id": query_id
         }
+        
+        # Add security notice if data was redacted
+        if any_redacted:
+            response["security_note"] = "Note: Sensitive data was redacted for security."
+        
+        return response
 
     except NoCredentialsError:
         return {
